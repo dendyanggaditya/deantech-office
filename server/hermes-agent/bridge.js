@@ -176,16 +176,18 @@ const toDisplayName = (name) =>
  * and sessions — which is exactly what Hermes3D calls an agent. Collapsing them
  * into one entry hides the operator's whole fleet, so each profile gets a desk.
  *
- * The `profile` field is what routes sessions back; the default profile carries
- * an empty string because omitting `profile` means "launch profile" upstream.
+ * The default profile is left out of the office: it cannot be deleted, and the
+ * operator only wants the named team on screen. Every desk is therefore a named
+ * profile, and its `profile` field — what routes sessions back — is that name.
+ * A backend with only the default profile maps to nothing and falls back to the
+ * single unnamed agent.
  */
 const toHermes3dAgents = (profiles) => {
   if (!Array.isArray(profiles)) return [];
   const agents = profiles
-    .filter((p) => p && typeof p === "object" && asString(p.name))
+    .filter((p) => p && typeof p === "object" && asString(p.name) && p.is_default !== true)
     .map((p) => {
       const name = asString(p.name);
-      const isDefault = p.is_default === true;
       const display = asString(p.display_name) || toDisplayName(name);
       // The long profile descriptions read as a role ("Allan — technical
       // planner…"); keep the part after the dash so the desk label stays short.
@@ -197,20 +199,17 @@ const toHermes3dAgents = (profiles) => {
         id: name,
         name: display,
         workspace: asString(p.path),
-        identity: { name: display, emoji: isDefault ? "🤖" : "🧑‍💻" },
+        identity: { name: display, emoji: "🧑‍💻" },
         role,
         model: asString(p.model),
-        isDefault,
-        profile: isDefault ? "" : name,
+        profile: name,
       };
     });
   return agents;
 };
 
-const resolveDefaultAgentId = (agents) => {
-  const explicit = agents.find((a) => a.isDefault);
-  return explicit?.id ?? agents[0]?.id ?? AGENT_ID;
-};
+/** The first desk is the default agent; the backend's default profile has none. */
+const resolveDefaultAgentId = (agents) => agents[0]?.id ?? AGENT_ID;
 
 function createHermesAgentUpstream(options) {
   const {

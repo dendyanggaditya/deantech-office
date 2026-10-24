@@ -266,32 +266,35 @@ describe("profiles as agents", () => {
     },
   ];
 
-  it("gives every profile its own agent", async () => {
+  it("gives every named profile its own agent and hides the default", async () => {
     const { toHermes3dAgents } = await import("../../server/hermes-agent/bridge");
     const agents = toHermes3dAgents(backendProfiles);
-    expect(agents.map((a) => a.id)).toEqual(["default", "allan", "andrew"]);
-    expect(agents.map((a) => a.name)).toEqual(["Default", "Allan", "Andrew"]);
+    expect(agents.map((a) => a.id)).toEqual(["allan", "andrew"]);
+    expect(agents.map((a) => a.name)).toEqual(["Allan", "Andrew"]);
   });
 
-  it("routes non-default agents by profile and leaves the default unnamed", async () => {
+  it("routes each agent by its profile name", async () => {
     const { toHermes3dAgents } = await import("../../server/hermes-agent/bridge");
-    const [def, allan] = toHermes3dAgents(backendProfiles);
-    // An empty profile means "launch profile" upstream; naming it is wrong.
-    expect(def.profile).toBe("");
-    expect(allan.profile).toBe("allan");
+    const agents = toHermes3dAgents(backendProfiles);
+    expect(agents.map((a) => a.profile)).toEqual(["allan", "andrew"]);
+  });
+
+  it("maps a backend with only the default profile to no agents", async () => {
+    const { toHermes3dAgents } = await import("../../server/hermes-agent/bridge");
+    expect(toHermes3dAgents([backendProfiles[0]])).toEqual([]);
   });
 
   it("uses the description after the dash as the role", async () => {
     const { toHermes3dAgents } = await import("../../server/hermes-agent/bridge");
-    const allan = toHermes3dAgents(backendProfiles)[1];
+    const allan = toHermes3dAgents(backendProfiles)[0];
     expect(allan.role.startsWith("technical planner")).toBe(true);
   });
 
-  it("picks the flagged profile as the default agent", async () => {
+  it("picks the first named profile as the default agent", async () => {
     const { toHermes3dAgents, resolveDefaultAgentId } = await import(
       "../../server/hermes-agent/bridge"
     );
-    expect(resolveDefaultAgentId(toHermes3dAgents(backendProfiles))).toBe("default");
+    expect(resolveDefaultAgentId(toHermes3dAgents(backendProfiles))).toBe("allan");
   });
 
   it("ignores unusable rows", async () => {
@@ -300,7 +303,7 @@ describe("profiles as agents", () => {
     expect(toHermes3dAgents(undefined)).toEqual([]);
   });
 
-  it("advertises every profile and creates sessions against the right one", async () => {
+  it("advertises only named profiles and creates sessions against the right one", async () => {
     const createCalls: Frame[] = [];
     const agent = await startFakeHermesAgent({
       "profiles.list": () => ({ profiles: backendProfiles }),
@@ -317,7 +320,8 @@ describe("profiles as agents", () => {
 
     bridge.send({ type: "req", id: "a1", method: "agents.list", params: {} });
     const listed = await bridge.waitFor((f) => f.type === "res" && f.id === "a1", "agents.list");
-    expect((at(listed, "payload.agents") as unknown[]).length).toBe(3);
+    const listedIds = (at(listed, "payload.agents") as Array<{ id: string }>).map((a) => a.id);
+    expect(listedIds).toEqual(["allan", "andrew"]);
 
     // A prompt aimed at Allan's desk must run under Allan's profile.
     bridge.send({
@@ -329,15 +333,14 @@ describe("profiles as agents", () => {
     await bridge.waitFor((f) => f.type === "res" && f.id === "s1", "chat.send");
     expect(createCalls.at(-1)).toEqual({ profile: "allan" });
 
-    // The default agent must NOT send a profile — that means "launch profile".
     bridge.send({
       type: "req",
       id: "s2",
       method: "chat.send",
-      params: { sessionKey: "agent:default:main", message: "hi" },
+      params: { sessionKey: "agent:andrew:main", message: "hi" },
     });
-    await bridge.waitFor((f) => f.type === "res" && f.id === "s2", "chat.send default");
-    expect(createCalls.at(-1)).toEqual({});
+    await bridge.waitFor((f) => f.type === "res" && f.id === "s2", "chat.send andrew");
+    expect(createCalls.at(-1)).toEqual({ profile: "andrew" });
   });
 
   it("falls back to a single agent when the backend has no profiles.list", async () => {
