@@ -508,12 +508,25 @@ function createHermesAgentUpstream(options) {
     });
   };
 
+  /** Relay a turn starting or ending anywhere, so the office can seat the agent. */
+  const handlePublishedActivity = (activity) => {
+    const agent = agentRoster.find((a) => a.id === activity.profile);
+    if (!agent) return;
+    emitEvent("office.activity", {
+      agentId: agent.id,
+      phase: activity.phase,
+      sessionId: activity.sessionId,
+      atMs: activity.atMs,
+    });
+  };
+
   const startOfficeSpeech = () => {
     if (officeSpeech) return;
     officeSpeech = createOfficeSpeechSubscriber({
       url,
       token,
       onTurn: handlePublishedTurn,
+      onActivity: handlePublishedActivity,
       log,
     });
   };

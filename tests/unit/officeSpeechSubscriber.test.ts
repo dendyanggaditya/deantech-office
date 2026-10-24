@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-const { MAX_TURN_AGE_MS, buildEventsUrl, parseTurnFrame } = await import(
+const { MAX_TURN_AGE_MS, buildEventsUrl, parseActivityFrame, parseTurnFrame } = await import(
   "../../server/hermes-agent/office-speech"
 );
 
@@ -73,5 +73,34 @@ describe("parseTurnFrame", () => {
 
   it("treats a turn with no timestamp as current", () => {
     expect(parseTurnFrame(frame({ atMs: undefined }), NOW)?.atMs).toBe(NOW);
+  });
+});
+
+describe("parseActivityFrame", () => {
+  const activity = (kind: string, overrides: Record<string, unknown> = {}) =>
+    JSON.stringify({ v: 1, kind, profile: "kuma", sessionId: "s1", atMs: NOW, ...overrides });
+
+  it("maps start and end frames to phases", () => {
+    expect(parseActivityFrame(activity("agent.turn.start"), NOW)).toEqual({
+      phase: "start",
+      profile: "kuma",
+      sessionId: "s1",
+      atMs: NOW,
+    });
+    expect(parseActivityFrame(activity("agent.turn.end"), NOW)?.phase).toBe("end");
+  });
+
+  it("drops a stale start but still honours a late end", () => {
+    const old = { atMs: NOW - MAX_TURN_AGE_MS - 1 };
+    expect(parseActivityFrame(activity("agent.turn.start", old), NOW)).toBeNull();
+    expect(parseActivityFrame(activity("agent.turn.end", old), NOW)?.phase).toBe("end");
+  });
+
+  it.each([
+    ["a speech frame", frame()],
+    ["a frame with no profile", activity("agent.turn.start", { profile: "" })],
+    ["malformed json", "{not json"],
+  ])("ignores %s", (_label, input) => {
+    expect(parseActivityFrame(input, NOW)).toBeNull();
   });
 });

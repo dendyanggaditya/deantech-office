@@ -53,6 +53,10 @@ const THINKING_ACTIVITY_LATCH_MS = 6_000;
 const STANDUP_TRIGGER_MAX_AGE_MS = 30_000;
 const CLEANING_CUE_LIMIT = 24;
 const TRANSIENT_BOOTH_RESTORE_MAX_AGE_MS = 2 * 60_000;
+// A turn driven from another client (desktop app, TUI, CLI, Telegram) is known
+// only through the office bridge plugin's start/end frames. The cap releases
+// the desk if an end frame is ever lost (backend restart, dropped socket).
+const EXTERNAL_TURN_MAX_MS = 15 * 60_000;
 
 type BooleanByAgentId = Record<string, boolean>;
 type NumberByAgentId = Record<string, number>;
@@ -90,6 +94,8 @@ export type OfficeAnimationTriggerState = {
   cleaningCues: OfficeCleaningCue[];
   deskDirectiveKeyByAgentId: StringByAgentId;
   deskHoldByAgentId: BooleanByAgentId;
+  /** Open external turns per agent: session id -> latest time it may still run. */
+  externalTurnsByAgentId: Record<string, NumberByAgentId>;
   githubDirectiveKeyByAgentId: StringByAgentId;
   githubHoldByAgentId: BooleanByAgentId;
   gymCooldownUntilByAgentId: NumberByAgentId;
@@ -212,6 +218,69 @@ const pruneFutureMap = (
         until > nowMs,
     ),
   );
+
+const pruneExternalTurns = (
+  source: Record<string, NumberByAgentId>,
+  activeAgentIds: Set<string>,
+  nowMs: number,
+): Record<string, NumberByAgentId> => {
+  const next: Record<string, NumberByAgentId> = {};
+  for (const [agentId, turns] of Object.entries(source)) {
+    if (!activeAgentIds.has(agentId)) continue;
+    const open = pruneFutureMap(turns, new Set(Object.keys(turns)), nowMs);
+    if (Object.keys(open).length > 0) next[agentId] = open;
+  }
+  return next;
+};
+
+type OfficeActivityPayload = {
+  agentId: string;
+  phase: "start" | "end";
+  sessionId: string;
+};
+
+const parseOfficeActivityPayload = (payload: unknown): OfficeActivityPayload | null => {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const agentId = typeof record.agentId === "string" ? record.agentId.trim() : "";
+  const phase = record.phase;
+  if (!agentId || (phase !== "start" && phase !== "end")) return null;
+  const sessionId = typeof record.sessionId === "string" ? record.sessionId : "";
+  return { agentId, phase, sessionId };
+};
+
+/**
+ * Track a turn started or finished outside Hermes3D.
+ *
+ * Turns are keyed by session so an agent running two conversations stays at
+ * its desk until both are done. Ending a turn leaves the normal short working
+ * latch behind, the same grace a locally driven run gets, so a quick turn
+ * still reads as the agent sitting down.
+ */
+const applyOfficeActivity = (
+  state: OfficeAnimationTriggerState,
+  activity: OfficeActivityPayload,
+  nowMs: number,
+): OfficeAnimationTriggerState => {
+  const turns = { ...(state.externalTurnsByAgentId[activity.agentId] ?? {}) };
+  if (activity.phase === "start") {
+    turns[activity.sessionId] = nowMs + EXTERNAL_TURN_MAX_MS;
+  } else {
+    delete turns[activity.sessionId];
+  }
+  const externalTurnsByAgentId = { ...state.externalTurnsByAgentId };
+  if (Object.keys(turns).length > 0) externalTurnsByAgentId[activity.agentId] = turns;
+  else delete externalTurnsByAgentId[activity.agentId];
+  return {
+    ...state,
+    externalTurnsByAgentId,
+    workingUntilByAgentId: recordWorkingActivity(
+      state.workingUntilByAgentId,
+      activity.agentId,
+      nowMs,
+    ),
+  };
+};
 
 const resolveMessageRole = (message: unknown): string | null => {
   if (!message || typeof message !== "object") return null;
@@ -610,6 +679,11 @@ const pruneOfficeAnimationTriggerState = (
       activeAgentIds,
     ),
     deskHoldByAgentId: pruneBooleanMap(state.deskHoldByAgentId, activeAgentIds),
+    externalTurnsByAgentId: pruneExternalTurns(
+      state.externalTurnsByAgentId,
+      activeAgentIds,
+      nowMs,
+    ),
     githubDirectiveKeyByAgentId: pruneStringMap(
       state.githubDirectiveKeyByAgentId,
       activeAgentIds,
@@ -899,6 +973,7 @@ export const createOfficeAnimationTriggerState =
     cleaningCues: [],
     deskDirectiveKeyByAgentId: emptyObject(),
     deskHoldByAgentId: emptyObject(),
+    externalTurnsByAgentId: emptyObject(),
     githubDirectiveKeyByAgentId: emptyObject(),
     githubHoldByAgentId: emptyObject(),
     gymCooldownUntilByAgentId: emptyObject(),
@@ -936,6 +1011,14 @@ export const reduceOfficeAnimationTriggerEvent = (params: {
     nowMs,
   );
   const kind = classifyGatewayEventKind(params.event.event);
+
+  if (params.event.event === "office.activity") {
+    const activity = parseOfficeActivityPayload(params.event.payload);
+    if (!activity || !params.agents.some((agent) => agent.agentId === activity.agentId)) {
+      return next;
+    }
+    return applyOfficeActivity(next, activity, nowMs);
+  }
 
   if (kind === "runtime-chat") {
     const payload = params.event.payload as ChatEventPayload | undefined;
@@ -1412,6 +1495,28 @@ export const buildOfficeAnimationState = (params: {
     streamingByAgentId,
     textMessageByAgentId,
     thinkingByAgentId,
-    workingUntilByAgentId: params.state.workingUntilByAgentId,
+    workingUntilByAgentId: holdWorkingForExternalTurns(
+      params.state.workingUntilByAgentId,
+      params.state.externalTurnsByAgentId,
+      nowMs,
+    ),
   };
+};
+
+/**
+ * An agent with an external turn still open counts as working right now. The
+ * latch is refreshed on every projection (the office re-projects every couple
+ * of seconds), so the agent stays seated for the whole turn, however long.
+ */
+const holdWorkingForExternalTurns = (
+  workingUntilByAgentId: NumberByAgentId,
+  externalTurnsByAgentId: Record<string, NumberByAgentId>,
+  nowMs: number,
+): NumberByAgentId => {
+  let next = workingUntilByAgentId;
+  for (const [agentId, turns] of Object.entries(externalTurnsByAgentId)) {
+    if (!Object.values(turns).some((until) => until > nowMs)) continue;
+    next = recordWorkingActivity(next, agentId, nowMs);
+  }
+  return next;
 };

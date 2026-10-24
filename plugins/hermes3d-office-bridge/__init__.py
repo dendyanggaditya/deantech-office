@@ -6,16 +6,22 @@ needs to know when an agent replied and what it said. Message events on the
 JSON-RPC gateway are delivered only to the client that submitted the prompt, so
 an office watching from the outside sees nothing when you chat somewhere else.
 
-This plugin closes that gap from inside the backend. It observes every finished
-turn through ``post_llm_call`` and republishes a small frame on the dashboard's
-event bus, which fans out to any subscriber. Chat wherever you like — the
-desktop app, the TUI, the CLI — and the office animates it.
+This plugin closes that gap from inside the backend. It observes every turn and
+republishes small frames on the dashboard's event bus, which fans out to any
+subscriber: ``agent.turn.start`` when a turn begins (``pre_llm_call``), the
+reply as ``agent.turn`` when it finishes (``post_llm_call``), and
+``agent.turn.end`` once the turn is over however it ended (``on_session_end``,
+which Hermes fires at the end of every turn, interrupted or failed included).
+Start and end let the office sit an agent at its desk while it works. Chat
+wherever you like — the desktop app, the TUI, the CLI — and the office animates
+it.
 
 Install it into each profile you want on screen; plugins are scoped to a
 ``HERMES_HOME``, so a profile without it stays silent. See ``install.sh``.
 
-Observation only: the hook never mutates the turn, never blocks it, and
-swallows its own failures.
+Observation only: the hooks never mutate the turn, never block it, return
+nothing (so ``pre_llm_call`` injects no context), and swallow their own
+failures.
 """
 
 from __future__ import annotations
@@ -31,6 +37,9 @@ from .publisher import OfficePublisher
 _log = logging.getLogger(__name__)
 
 FRAME_VERSION = 1
+
+TURN_START_KIND = "agent.turn.start"
+TURN_END_KIND = "agent.turn.end"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9119
@@ -64,6 +73,30 @@ def build_turn_frame(
         "kind": "agent.turn",
         "profile": profile or "",
         "text": body,
+        "sessionId": session_id or "",
+        "platform": platform or "",
+        "atMs": int(at_ms if at_ms is not None else time.time() * 1000),
+    }
+
+
+def build_activity_frame(
+    *,
+    kind: str,
+    profile: str,
+    session_id: str = "",
+    platform: str = "",
+    at_ms: Optional[int] = None,
+) -> dict:
+    """Build the wire frame marking a turn's start or end (``kind``).
+
+    It carries no text: the office only needs to know the agent is busy, and
+    ``session_id`` pairs the end with its start when one agent has several
+    conversations open at once.
+    """
+    return {
+        "v": FRAME_VERSION,
+        "kind": kind,
+        "profile": profile or "",
         "sessionId": session_id or "",
         "platform": platform or "",
         "atMs": int(at_ms if at_ms is not None else time.time() * 1000),
@@ -175,6 +208,31 @@ def _handle_post_llm_call(**kwargs: Any) -> None:
         _log.debug("hermes3d-office-bridge: publish skipped: %s", exc)
 
 
+def _publish_activity(kind: str, kwargs: dict) -> None:
+    if _publisher is None:
+        return
+    try:
+        _publisher.publish(
+            build_activity_frame(
+                kind=kind,
+                profile=_resolve_profile(),
+                session_id=str(kwargs.get("session_id") or ""),
+                platform=str(kwargs.get("platform") or ""),
+            )
+        )
+    except Exception as exc:
+        _log.debug("hermes3d-office-bridge: activity publish skipped: %s", exc)
+
+
+def _handle_pre_llm_call(**kwargs: Any) -> None:
+    # Returning None is deliberate: anything else would be injected as context.
+    _publish_activity(TURN_START_KIND, kwargs)
+
+
+def _handle_on_session_end(**kwargs: Any) -> None:
+    _publish_activity(TURN_END_KIND, kwargs)
+
+
 def register(ctx: Any) -> None:
     global _publisher
 
@@ -205,4 +263,6 @@ def register(ctx: Any) -> None:
     # before a background send completes. Give the queue a bounded chance to
     # drain so those turns reach the office too, not just long-lived backends.
     atexit.register(_publisher.flush)
+    ctx.register_hook("pre_llm_call", _handle_pre_llm_call)
     ctx.register_hook("post_llm_call", _handle_post_llm_call)
+    ctx.register_hook("on_session_end", _handle_on_session_end)

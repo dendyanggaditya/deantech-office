@@ -457,3 +457,55 @@ describe("office event triggers", () => {
     expect(animationState.smsBoothHoldByAgentId.main).toBeUndefined();
   });
 });
+
+describe("external turn activity", () => {
+  const agents = [
+    makeAgent({ agentId: "kuma", name: "Kuma", sessionKey: "agent:kuma:main" }),
+  ];
+  const activity = (phase: "start" | "end", sessionId = "s1"): EventFrame => ({
+    type: "event",
+    event: "office.activity",
+    payload: { agentId: "kuma", phase, sessionId },
+  });
+  const reduce = (state: ReturnType<typeof createOfficeAnimationTriggerState>, event: EventFrame, nowMs: number) =>
+    reduceOfficeAnimationTriggerEvent({ state, event, agents, nowMs });
+  const isWorking = (state: ReturnType<typeof createOfficeAnimationTriggerState>, nowMs: number) =>
+    (buildOfficeAnimationState({ state, agents, nowMs }).workingUntilByAgentId.kuma ?? 0) > nowMs;
+
+  it("keeps an agent working for the whole turn, past the short latch", () => {
+    const started = reduce(createOfficeAnimationTriggerState(), activity("start"), 1_000);
+    // Two minutes in: far beyond the 5 s latch a single event would give.
+    expect(isWorking(started, 121_000)).toBe(true);
+  });
+
+  it("releases the agent shortly after the turn ends", () => {
+    const started = reduce(createOfficeAnimationTriggerState(), activity("start"), 1_000);
+    const ended = reduce(started, activity("end"), 60_000);
+    expect(isWorking(ended, 61_000)).toBe(true);
+    expect(isWorking(ended, 70_000)).toBe(false);
+  });
+
+  it("stays seated until every open session has ended", () => {
+    let state = reduce(createOfficeAnimationTriggerState(), activity("start", "a"), 1_000);
+    state = reduce(state, activity("start", "b"), 2_000);
+    state = reduce(state, activity("end", "a"), 3_000);
+    expect(isWorking(state, 60_000)).toBe(true);
+    state = reduce(state, activity("end", "b"), 60_000);
+    expect(isWorking(state, 70_000)).toBe(false);
+  });
+
+  it("gives up on a turn whose end never arrived", () => {
+    const started = reduce(createOfficeAnimationTriggerState(), activity("start"), 1_000);
+    expect(isWorking(started, 1_000 + 16 * 60_000)).toBe(false);
+  });
+
+  it("ignores activity for an agent the office does not show", () => {
+    const state = reduceOfficeAnimationTriggerEvent({
+      state: createOfficeAnimationTriggerState(),
+      event: { type: "event", event: "office.activity", payload: { agentId: "default", phase: "start", sessionId: "s" } },
+      agents,
+      nowMs: 1_000,
+    });
+    expect(state.externalTurnsByAgentId).toEqual({});
+  });
+});

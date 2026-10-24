@@ -117,6 +117,13 @@ frame naming a profile the office does not show is ignored.
 
 ## What you see in the office
 
+While an agent is working on a turn — wherever you started it — it walks to
+its assigned desk and sits down, and it stays seated until the turn ends. The
+plugin publishes `agent.turn.start` and `agent.turn.end` frames for this; if an
+end frame is ever lost (say the backend restarted mid-turn), the desk is
+released after 15 minutes. An agent with no desk assigned in the office stays
+where it is while it works; assign one from the desk's edit menu.
+
 Two or more agents replying inside the same ~25 second window count as a
 conversation. When that happens:
 

@@ -26,6 +26,12 @@ const RECONNECT_BACKOFF_MS = [1_000, 2_000, 5_000, 15_000, 30_000];
 /** Frame shape the plugin emits; anything else on the channel is ignored. */
 const FRAME_KIND = "agent.turn";
 
+/** Turn-activity frames: an agent started or finished a turn. */
+const ACTIVITY_PHASE_BY_KIND = {
+  "agent.turn.start": "start",
+  "agent.turn.end": "end",
+};
+
 /**
  * A turn older than this is dropped. Reconnecting can deliver a backlog, and
  * replaying stale speech would huddle idle characters for no reason.
@@ -64,14 +70,8 @@ const redactUrl = (url) => String(url).replace(/([?&]token=)[^&]*/gi, "$1***");
  * office.
  */
 const parseTurnFrame = (raw, nowMs = Date.now()) => {
-  let frame;
-  try {
-    frame = JSON.parse(typeof raw === "string" ? raw : String(raw));
-  } catch {
-    return null;
-  }
-  if (!frame || typeof frame !== "object") return null;
-  if (frame.kind !== FRAME_KIND) return null;
+  const frame = decodeFrame(raw);
+  if (!frame || frame.kind !== FRAME_KIND) return null;
 
   const profile = typeof frame.profile === "string" ? frame.profile.trim() : "";
   const text = typeof frame.text === "string" ? frame.text.trim() : "";
@@ -89,10 +89,49 @@ const parseTurnFrame = (raw, nowMs = Date.now()) => {
 };
 
 /**
+ * Validate one turn-activity frame (`agent.turn.start` / `agent.turn.end`).
+ *
+ * Returns `{ phase, profile, sessionId, atMs }` or null. A stale start is
+ * dropped like a stale turn — it would sit an agent down for work that already
+ * finished — but an end is honoured however late it arrives, because the only
+ * thing it can do is let an agent get up.
+ */
+const parseActivityFrame = (raw, nowMs = Date.now()) => {
+  const frame = decodeFrame(raw);
+  if (!frame) return null;
+  const phase = ACTIVITY_PHASE_BY_KIND[frame.kind];
+  if (!phase) return null;
+
+  const profile = typeof frame.profile === "string" ? frame.profile.trim() : "";
+  if (!profile) return null;
+
+  const atMs = Number.isFinite(frame.atMs) ? Number(frame.atMs) : nowMs;
+  if (phase === "start" && nowMs - atMs > MAX_TURN_AGE_MS) return null;
+
+  return {
+    phase,
+    profile,
+    sessionId: typeof frame.sessionId === "string" ? frame.sessionId : "",
+    atMs,
+  };
+};
+
+const decodeFrame = (raw) => {
+  let frame;
+  try {
+    frame = JSON.parse(typeof raw === "string" ? raw : String(raw));
+  } catch {
+    return null;
+  }
+  return frame && typeof frame === "object" ? frame : null;
+};
+
+/**
  * Subscribe to published turns.
  *
- * `onTurn` is called with `{ profile, text, sessionId, atMs }`. Returns a
- * handle with `close()`.
+ * `onTurn` is called with `{ profile, text, sessionId, atMs }` and
+ * `onActivity` with `{ phase, profile, sessionId, atMs }`. Returns a handle
+ * with `close()`.
  */
 function createOfficeSpeechSubscriber(options) {
   const {
@@ -100,6 +139,7 @@ function createOfficeSpeechSubscriber(options) {
     token,
     channel = DEFAULT_CHANNEL,
     onTurn,
+    onActivity,
     hostHeader = "",
     loopbackHostFallback = true,
     log = () => {},
@@ -146,12 +186,14 @@ function createOfficeSpeechSubscriber(options) {
     ws.on("message", (raw) => {
       const asText = Buffer.isBuffer(raw) ? raw.toString() : raw;
       const turn = parseTurnFrame(asText);
-      if (!turn) {
+      const activity = turn ? null : parseActivityFrame(asText);
+      if (!turn && !activity) {
         log("[office-speech] frame rejected by parser");
         return;
       }
       try {
-        onTurn?.(turn);
+        if (turn) onTurn?.(turn);
+        else onActivity?.(activity);
       } catch (err) {
         log(`[office-speech] handler failed: ${err.message}`);
       }
@@ -196,5 +238,6 @@ module.exports = {
   MAX_TURN_AGE_MS,
   buildEventsUrl,
   createOfficeSpeechSubscriber,
+  parseActivityFrame,
   parseTurnFrame,
 };
